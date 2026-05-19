@@ -1,14 +1,14 @@
 {
     "$schema": "https://go.kicad.org/pcm/schemas/v1",
     "name": "LLM Schematic Analyser",
-    "description": "Inspect your schematic with an LLM and get design improvement suggestions.",
-    "description_full": "This plugin lets you inspect your KiCad schematic or PCB with a large language model. It supports cloud models (Claude, GPT-4) and local models via Ollama.\n\nOriginal: jasiek/kicad-llm-plugin. Updated for KiCad 10 by northstarcomp. MIT License.",
+    "description": "Inspect your schematic and PCB with an LLM.",
+    "description_full": "v1.7.0: Full model list (xAI/Anthropic/OpenAI/Gemini/Ollama). Dual schematic+PCB analysis. Unlimited prompt data \u2014 no component truncation. Wire count, lib_id, layer info in prompts.",
     "identifier": "com.github.northstarcomp.kicad-llm-plugin",
     "type": "plugin",
     "author": {
         "name": "northstarcomp",
         "contact": {
-            "github": "https://github.com/northstarcomp"
+            "github": "https://github.com/northstarcomp/kicad-llm-plugin"
         }
     },
     "license": "MIT",
@@ -17,7 +17,7 @@
     },
     "versions": [
         {
-            "version": "1.0.2",
+            "version": "1.7.0",
             "status": "stable",
             "kicad_version": "8.0"
         }

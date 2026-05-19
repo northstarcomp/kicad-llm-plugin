@@ -1,378 +1,44 @@
-# KiCad LLM Plugin — Annotated Review
-## v1.5.0 Polished Edition (persistent keys, token display, copy buttons)
-
-Fix tags: `[BUG]` = will crash or break silently | `[RISK]` = may fail in some environments | `[OK]` = correct | `[NOTE]` = informational
-
----
-
-```python
 """
-KiCad LLM Plugin v1.5.0
-Complete polished version with persistent keys, nice token display, and copy buttons.
-...
+KiCad LLM Plugin v1.7.0 RC8 (Full Model List)    # [OK] correct version in docstring
 """
 
-import os
-import sys
-import json           # [NOTE] json imported here at top level AND again inside _call_llm.
-import traceback      #        The duplicate import inside _call_llm is harmless but redundant —
-from pathlib import Path  #   safe to remove the one inside _call_llm.
+import os, sys, json, traceback
+from pathlib import Path
 
-# [BUG-1] import pcbnew and import wx are at module level, OUTSIDE the try/except block.
-# If KiCad's pcbnew module is not on sys.path at import time (e.g. when running a
-# linter, test runner, or if the plugin path is wrong), this raises ImportError and
-# the entire plugin file fails to load with no useful error shown in KiCad.
-# FIX: move both imports inside the try/except block (see original v1.5.0 structure).
-import pcbnew
-import wx
+_HERE = os.path.dirname(os.path.abspath(__file__))  # [OK] module-level, abspath — correct
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
+
+# ── ConfigManager ─────────────────────────────────────────────────────────
 
 class ConfigManager:
     def __init__(self):
-        # [RISK-1] mkdir(exist_ok=True) WITHOUT parents=True.
-        # On a fresh Linux/Mac install ~/.kicad may not exist yet.
-        # If it doesn't, this raises FileNotFoundError and ConfigManager.__init__
-        # crashes, which means `config = ConfigManager()` at module level (see BUG-2)
-        # crashes before KiCad even gets to load the plugin class.
-        # FIX: self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path = Path.home() / ".kicad" / "kicad_llm_config.json"
-        self.config_path.parent.mkdir(exist_ok=True)   # ← needs parents=True
+        # [OK] ~/.local/share/kicad/ — correct KiCad 10 Linux location (FIX-2)
+        self.config_path = Path.home() / ".local" / "share" / "kicad" / "kicad_llm_config.json"
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)  # [OK] parents=True (FIX-16)
         self.data = self._load()
 
     def _load(self):
         if self.config_path.exists():
-            try:
-                return json.loads(self.config_path.read_text())
-            except Exception:
-                pass
-        return {"last_model_index": 0, "api_keys": {}}   # [OK] safe default
+            try: return json.loads(self.config_path.read_text())
+            except: pass   # [OK] silent fallback to defaults
+        return {"last_model_index": 0, "api_keys": {}}
 
     def save(self):
-        try:
-            self.config_path.write_text(json.dumps(self.data, indent=2))
-        except Exception:
-            pass   # [OK] silent fail on save is acceptable — config is non-critical
+        try: self.config_path.write_text(json.dumps(self.data, indent=2))
+        except: pass  # [OK] silent failure — plugin still works if disk is full
 
-    def get_api_key(self, provider: str) -> str:
-        return self.data.get("api_keys", {}).get(provider, "")   # [OK]
-
-    def set_api_key(self, provider: str, key: str):
-        if "api_keys" not in self.data:
-            self.data["api_keys"] = {}
-        self.data["api_keys"][provider] = key
-        self.save()   # [OK]
-
-    def get_last_model_index(self) -> int:
-        return self.data.get("last_model_index", 0)   # [OK]
-
-    def set_last_model_index(self, index: int):
-        self.data["last_model_index"] = index
-        self.save()   # [OK]
+    def get_api_key(self, provider): return self.data.get("api_keys", {}).get(provider, "")
+    def set_api_key(self, provider, key):
+        self.data.setdefault("api_keys", {})[provider] = key; self.save()
+    def get_last_model_index(self): return self.data.get("last_model_index", 0)
+    def set_last_model_index(self, idx): self.data["last_model_index"] = idx; self.save()
 
 
-# [BUG-2] config = ConfigManager() runs at module level, before the try/except
-# that guards pcbnew/wx. If ConfigManager.__init__ raises (e.g. due to RISK-1
-# above), the entire module fails to load and the plugin never registers.
-# This also means any exception in ConfigManager is NOT caught by the try/except
-# below and will NOT produce a traceback in KiCad's scripting console.
-# FIX: move `config = ConfigManager()` inside the try/except block, or wrap it
-# in its own try/except with a fallback to a no-op config object.
-config = ConfigManager()
-
-# [OK] _HERE captured correctly at module level with abspath — required for KiCad 10.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-# [NOTE] The try/except below is correct for guarding plugin registration, but
-# because pcbnew and wx are imported above (BUG-1), exceptions from those imports
-# are not caught here. Only errors in the class definition and .register() are caught.
-try:
-    class LLMAnalyserPlugin(pcbnew.ActionPlugin):
-        def defaults(self):
-            self.name = "LLM Schematic Analyser"
-            self.category = "Analyse"
-            self.description = "Inspect your schematic with an LLM and get design improvement suggestions"
-            self.show_toolbar_button = True          # [OK] FIX-4 from v1.5.0
-            icon = os.path.join(_HERE, "icon.png")
-            icon_dark = os.path.join(_HERE, "icon_dark.png")
-            self.icon_file_name = icon if os.path.isfile(icon) else ""          # [OK] FIX-5
-            self.dark_icon_file_name = icon_dark if os.path.isfile(icon_dark) else self.icon_file_name  # [OK] FIX-6
-
-        def Run(self):
-            board = pcbnew.GetBoard()
-            if board is None:
-                wx.MessageBox("No board is open. Open the PCB editor first.", "LLM Analyser", wx.OK | wx.ICON_WARNING)
-                return
-            dlg = _LLMDialog(None, _collect_board_info(board))
-            dlg.ShowModal()
-            dlg.Destroy()   # [OK]
-
-    LLMAnalyserPlugin().register()
-except Exception:
-    traceback.print_exc()
-
-
-def _collect_board_info(board):
-    info = {"title": str(board.GetTitleBlock().GetTitle()) or "(untitled)", "footprints": [], "nets": []}
-    for fp in board.GetFootprints():                   # [OK] FIX-8: GetFootprints not GetModules
-        info["footprints"].append({
-            "ref": str(fp.GetReference()),             # [OK] FIX-7: wxString → str
-            "value": str(fp.GetValue()),               # [OK] FIX-7
-            "layer": str(board.GetLayerName(fp.GetLayer())),  # [OK] FIX-7
-        })
-    for net_code, net in board.GetNetInfo().NetsByName().items():
-        if net_code:
-            info["nets"].append(str(net_code))         # [OK] FIX-7
-    return info
-
-
-class _LLMDialog(wx.Dialog):
-    _MODELS = [
-        ("Grok 4 (xAI)",          "grok-4",                    "https://api.x.ai/v1",      "xai"),
-        ("Grok 4 Fast (xAI)",     "grok-4-fast",               "https://api.x.ai/v1",      "xai"),
-        ("Grok 3 (xAI)",          "grok-3-latest",             "https://api.x.ai/v1",      "xai"),
-        ("Grok 3 Mini (xAI)",     "grok-3-mini-latest",        "https://api.x.ai/v1",      "xai"),
-        ("Claude Sonnet 4",       "claude-sonnet-4-20250514",  None,                        "anthropic"),
-        ("Claude Opus 4",         "claude-opus-4-20250514",    None,                        "anthropic"),
-        ("GPT-4o (OpenAI)",       "gpt-4o",                    None,                        "openai"),
-        ("GPT-4o-mini (OpenAI)",  "gpt-4o-mini",               None,                        "openai"),
-        ("Ollama llama3 (local)", "llama3",                    "http://localhost:11434/v1", "openai"),
-        ("Ollama mistral (local)","mistral",                   "http://localhost:11434/v1", "openai"),
-    ]   # [OK] 4-tuple with api_type — correct pattern from FIX-9
-
-    _PROVIDER_MAP = {"anthropic": "Anthropic", "openai": "OpenAI / Ollama", "xai": "xAI (Grok)"}  # [OK] nice addition
-
-    def __init__(self, parent, board_info):
-        super().__init__(parent, title="LLM Schematic Analyser", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
-        self._info = board_info
-        self._build_ui()
-        self._load_last_model_and_key()   # [OK] good UX — restores last used model
-
-    def _load_last_model_and_key(self):
-        idx = config.get_last_model_index()
-        if idx < len(self._MODELS):
-            self._model.SetSelection(idx)
-            self._on_model_changed(None)   # [OK] passing None is safe — _event param unused
-
-    def _on_model_changed(self, _event):
-        idx = int(self._model.GetSelection())   # [OK] FIX-10: int() cast
-        _, _, default_url, api_type = self._MODELS[idx]
-        self._url.SetValue(default_url or "")   # [OK] handles None base_url for cloud models
-        self._key.SetValue(config.get_api_key(api_type))   # [OK] restores saved key per provider
-
-    def _on_clear_keys(self, _event):
-        idx = int(self._model.GetSelection())   # [OK] FIX-10: int() cast
-        _, _, _, api_type = self._MODELS[idx]
-        name = self._PROVIDER_MAP.get(api_type, api_type)
-        if wx.MessageBox(f"Clear saved key for {name}?", "Clear Key", wx.YES_NO) == wx.YES:
-            config.set_api_key(api_type, "")
-            self._key.SetValue("")   # [OK]
-
-    def _on_run(self, _event):
-        idx = int(self._model.GetSelection())   # [OK] FIX-10: int() cast
-        _, model_id, default_url, api_type = self._MODELS[idx]
-        api_key = str(self._key.GetValue()).strip()    # [OK] FIX-7: str() cast
-        base_url = str(self._url.GetValue()).strip() or default_url   # [OK] FIX-7
-
-        if api_key:
-            config.set_api_key(api_type, api_key)   # [OK] auto-saves key on use
-        config.set_last_model_index(idx)             # [OK] persists model choice
-
-        if not api_key and api_type != "openai":
-            wx.MessageBox("Please enter an API key.", "Error", wx.OK | wx.ICON_WARNING)
-            return
-
-        self._run_btn.Disable()
-        self._result.SetValue("Running…")
-        self._token_input.SetLabel("0")
-        self._token_output.SetLabel("0")
-        self._token_total.SetLabel("0")
-        wx.Yield()
-
-        try:
-            text, usage = self._call_llm(model_id, api_key, base_url, api_type)
-        except Exception as e:
-            text = f"Error: {e}"
-            usage = {}   # [OK] safe fallback so token display shows 0s not crash
-
-        self._result.SetValue(text)
-
-        # [OK] Token display correctly split by api_type using correct field names per provider.
-        # Anthropic: input_tokens / output_tokens (no total)
-        # xAI:       input_tokens / output_tokens / total_tokens
-        # OpenAI:    prompt_tokens / completion_tokens / total_tokens
-        if api_type == "anthropic":
-            self._token_input.SetLabel(str(usage.get("input_tokens", 0)))
-            self._token_output.SetLabel(str(usage.get("output_tokens", 0)))
-            self._token_total.SetLabel("N/A")   # [OK] Anthropic doesn't return total
-        elif api_type == "xai":
-            self._token_input.SetLabel(str(usage.get("input_tokens", 0)))
-            self._token_output.SetLabel(str(usage.get("output_tokens", 0)))
-            self._token_total.SetLabel(str(usage.get("total_tokens", 0)))
-        else:
-            self._token_input.SetLabel(str(usage.get("prompt_tokens", 0)))
-            self._token_output.SetLabel(str(usage.get("completion_tokens", 0)))
-            self._token_total.SetLabel(str(usage.get("total_tokens", 0)))
-
-        self._run_btn.Enable()   # [OK]
-
-    def _on_copy_result(self, _event):
-        self._copy_to_clipboard(self._result.GetValue())   # [OK]
-
-    def _on_copy_tokens(self, _event):
-        text = (f"Input: {self._token_input.GetLabel()}\n"
-                f"Output: {self._token_output.GetLabel()}\n"
-                f"Total: {self._token_total.GetLabel()}")
-        self._copy_to_clipboard(text)   # [OK]
-
-    def _copy_to_clipboard(self, text):
-        if wx.TheClipboard.Open():
-            wx.TheClipboard.SetData(wx.TextDataObject(text))
-            wx.TheClipboard.Close()
-            # [RISK-2] wx.MessageBox after clipboard copy requires user to click OK
-            # just to confirm a copy. Annoying UX for a button whose action is
-            # self-evident. Consider replacing with a brief status label instead.
-            wx.MessageBox("Copied to clipboard", "Success", wx.OK | wx.ICON_INFORMATION)
-
-    def _prompt(self):
-        lines = [
-            "You are an electronics design expert reviewing a KiCad schematic/PCB.",
-            "Based on the component list and net names below, identify:",
-            "1. Fatal flaws",
-            "2. Design-rule / best-practice violations",
-            "3. Nice-to-have improvements",
-            "",
-            f"Board: {self._info['title']}",
-            "",
-            "Footprints (ref, value, layer):",
-        ]
-        for fp in self._info["footprints"]:
-            lines.append(f"  {fp['ref']}  {fp['value']}  ({fp['layer']})")
-        lines += ["", "Nets (up to 120):"]
-        for net in sorted(self._info["nets"])[:120]:   # [OK] safe — nets already str() from _collect_board_info
-            lines.append(f"  {net}")
-        return "\n".join(lines)
-
-    def _call_llm(self, model_id, api_key, base_url, api_type):
-        import json, urllib.request   # [NOTE] json already imported at top — redundant but harmless
-        prompt = self._prompt()
-        system = "You are an electronics design expert reviewing a KiCad schematic/PCB."
-
-        if api_type == "anthropic":
-            url = "https://api.anthropic.com/v1/messages"
-            hdrs = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
-            # [OK] system passed as top-level "system" field — correct Anthropic API format
-            # and slightly better than embedding it in messages[].
-            body = {"model": model_id, "max_tokens": 4096, "system": system,
-                    "messages": [{"role": "user", "content": prompt}]}
-
-        elif api_type == "xai":
-            url = (base_url or "https://api.x.ai/v1") + "/responses"
-            hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-            # [OK] FIX-11: plain string input, max_output_tokens — correct Responses API format
-            body = {"model": model_id, "max_output_tokens": 4096, "input": f"{system}\n\n{prompt}"}
-
-        else:
-            url = (base_url or "https://api.openai.com/v1") + "/chat/completions"
-            hdrs = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-            body = {"model": model_id, "max_tokens": 4096,
-                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]}
-
-        req = urllib.request.Request(url, json.dumps(body).encode(), hdrs, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            # [OK] FIX-12: surfaces actual API error message from response body
-            err_body = e.read().decode("utf-8", errors="replace")
-            try:
-                err_json = json.loads(err_body)
-                err_msg = err_json.get("error", {})
-                if isinstance(err_msg, dict):
-                    err_msg = err_msg.get("message", err_body)
-            except Exception:
-                err_msg = err_body
-            raise RuntimeError(f"HTTP {e.code} {e.reason}: {err_msg}")
-
-        if api_type == "anthropic":
-            result = data["content"][0]["text"]   # [OK] FIX-13
-            usage = data.get("usage", {})
-        elif api_type == "xai":
-            result = data["output"][0]["content"][0]["text"]   # [OK] FIX-14
-            usage = data.get("usage", {})
-        else:
-            result = data["choices"][0]["message"]["content"]
-            usage = data.get("usage", {})
-
-        # [OK] FIX-15: returns (result, usage) as tuple — clean separation,
-        # lets the dialog handle display logic independently of API parsing.
-        return result, usage
-```
-
----
-
-## Issue Summary
-
-### Must Fix
-
-| # | Location | Issue | Fix |
-|---|----------|-------|-----|
-| BUG-1 | Top of file | `import pcbnew` and `import wx` outside `try/except` — import failure silently kills the plugin | Move both imports inside the `try:` block |
-| BUG-2 | Top of file | `config = ConfigManager()` at module level outside `try/except` — constructor failure kills plugin silently | Wrap in `try/except` with a no-op fallback config |
-| RISK-1 | `ConfigManager.__init__` | `mkdir(exist_ok=True)` without `parents=True` — crashes on fresh installs where `~/.kicad` doesn't exist | Change to `mkdir(parents=True, exist_ok=True)` |
-
-### Minor / UX
-
-| # | Location | Note |
-|---|----------|-------|
-| RISK-2 | `_copy_to_clipboard` | `wx.MessageBox("Copied!")` requires a click to dismiss — annoying for a copy button. Consider a status label instead. |
-| NOTE-1 | `_call_llm` | `import json` inside the method is redundant since it's already at the top of the file. Safe to remove. |
-
----
-
-## What's New and Good in This Version
-
-| Feature | Assessment |
-|---------|------------|
-| `ConfigManager` — persistent API keys per provider | Excellent — saves re-entering keys every session |
-| Last model index restored on open | Good UX |
-| Token usage in dedicated `StaticBoxSizer` panel | Much cleaner than appending to result text |
-| Separate copy buttons for result and tokens | Useful, especially tokens for cost tracking |
-| `"system"` as top-level Anthropic field | Correct and slightly better API usage |
-| `usage = {}` fallback on exception in `_on_run` | Prevents token display crashing when API fails |
-| `return result, usage` tuple from `_call_llm` | Clean separation of concerns |
-| All FIX-1 through FIX-15 from v1.5.0 preserved | All prior fixes intact |
-
----
-
-## Recommended Fix — Corrected Top-of-File Structure
-
-```python
-import os
-import sys
-import json
-import traceback
-from pathlib import Path
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-
-class ConfigManager:
-    def __init__(self):
-        self.config_path = Path.home() / ".kicad" / "kicad_llm_config.json"
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)  # RISK-1 fixed
-        self.data = self._load()
-    # ... rest unchanged ...
-
-
-def _make_config():
-    """Safe factory — returns a no-op config if ConfigManager fails."""
-    try:
-        return ConfigManager()
-    except Exception:
+def _make_config():                    # [OK] safe factory — failures don't crash plugin
+    try: return ConfigManager()
+    except:
         traceback.print_exc()
         class _NullConfig:
             def get_api_key(self, p): return ""
@@ -382,17 +48,295 @@ def _make_config():
         return _NullConfig()
 
 
-try:
-    import pcbnew        # BUG-1 fixed — inside try/except
-    import wx            # BUG-1 fixed
+# ── S-Expression Parser ───────────────────────────────────────────────────
 
-    config = _make_config()   # BUG-2 fixed — inside try/except, after imports confirmed
+# [OK] Proper recursive-descent parser (SEXP-1 from v1.7.0) — handles multi-line
+# properties, escaped quotes, and nested structures correctly. Much more robust
+# than the regex approach used in v1.6.0.
+
+def parse_sexp(text): ...
+def tokenize(text): ...
+def read_expr(tokens, pos): ...
+def find_all(expr, tag): ...
+def get_prop(node, name): ...
+def first_atom(node, tag): ...
+
+
+# ── Context collection ────────────────────────────────────────────────────
+
+def _collect_context(board, include_datasheet_links=False):
+    info = {
+        "context": "pcb",
+        "title": "(untitled)",
+        "footprints": [],
+        "nets": [],
+        "sch_file": "",
+        "symbols": [],
+        "pwr_symbols": [],
+        "sch_nets": [],
+        "no_connects": 0,
+        # [OK] datasheet_links always present in dict — avoids KeyError in prompt builder
+        "datasheet_links": {}
+    }
+    # [OK] str() casts on all KiCad API returns — prevents wxString crash (FIX-7)
+    # [OK] GetFootprints() — correct KiCad 7+ API (FIX-8)
+    for fp in board.GetFootprints(): ...
+    for net_code, _ in board.GetNetInfo().NetsByName().items(): ...
+
+    pcb_path = str(board.GetFileName())
+    if pcb_path:
+        sch_data = _find_and_parse_schematic(Path(pcb_path), include_datasheet_links)
+        if sch_data:
+            info.update(sch_data)
+            info["context"] = "both"
+    return info
+
+
+def _find_and_parse_schematic(pcb_path, include_datasheet_links=False):
+    candidates = list(pcb_path.parent.glob("*.kicad_sch"))
+    if not candidates: return None
+    preferred = [f for f in candidates if f.stem == pcb_path.stem]
+    sch_file = preferred[0] if preferred else candidates[0]
+    # [OK] full traceback printed to KiCad scripting console on parse error (SEXP-8)
+    try: return _parse_kicad_sch(sch_file, include_datasheet_links)
+    except: traceback.print_exc(); return None
+
+
+def _parse_kicad_sch(sch_file, include_datasheet_links=False):
+    ...
+    for sym in find_all(root, 'symbol'):
+        lib_id = first_atom(sym, 'lib_id')
+        ref    = get_prop(sym, 'Reference') or "?"
+        value  = get_prop(sym, 'Value')     or "?"
+        entry  = {"lib_id": lib_id, "ref": ref, "value": value}
+
+        if include_datasheet_links:
+            ds = get_prop(sym, 'Datasheet')
+            if ds and ds.startswith("http"):
+                # [OK] Deduplication by URL — groups refs sharing the same datasheet
+                if ds not in datasheet_links:
+                    datasheet_links[ds] = []
+                datasheet_links[ds].append(ref)
+
+        # [BUG-RC8-1] Power detection uses value string matching:
+        #   value.upper() in ("VCC", "GND", "+3V3", "+5V")
+        # This incorrectly classifies ANY symbol whose Value field matches
+        # those strings as a power symbol. A resistor with Value "GND" (used
+        # as a net-tie or termination), or a test point labelled "+5V", would
+        # be moved to pwr_symbols and hidden from the main symbol list.
+        # FIX: remove value-string check; rely only on lib_id prefix and #PWR ref.
+        if lib_id.lower().startswith("power:") or value.upper() in ("VCC", "GND", "+3V3", "+5V"):
+            pwr_symbols.append(entry)   # ← BUG: value check too broad
+        # FIXED version:
+        # if lib_id.lower().startswith("power:") or (ref and ref.startswith("#PWR")):
+        #     pwr_symbols.append(entry)
+
+    # [BUG-RC8-3] Net label extraction only handles KiCad 10 format.
+    # KiCad 10: (net_label (text "VCC") ...)  — text is a (text "...") child list ✓
+    # KiCad 8/9: (net_label "VCC" ...)         — text is the second atom of the node ✗ missing
+    # If a KiCad 8/9 schematic is opened, ALL net label names will be silently
+    # lost, producing an empty sch_nets list and a less useful LLM prompt.
+    for tag in ('net_label', 'global_label', 'hierarchical_label'):
+        for node in find_all(root, tag):
+            for child in node:
+                if isinstance(child, list) and child and child[0] == 'text':
+                    if len(child) > 1: sch_nets.add(child[1]); break
+    # FIXED version handles both formats:
+    # for child in node:
+    #     if isinstance(child, list) and child[0] == 'text' and len(child) > 1:
+    #         txt = child[1]; break
+    # if not txt and len(node) > 1 and isinstance(node[1], str):
+    #     txt = node[1]   # ← KiCad 8/9 inline string fallback
+    # if txt: sch_nets.add(txt)
+
+    result = {
+        "sch_file": sch_file.name,
+        "symbols": symbols,
+        "pwr_symbols": pwr_symbols,
+        "sch_nets": sorted(sch_nets),
+        "no_connects": len(find_all(root, 'no_connect')),
+        # [NOTE-1] wire_count was present in v1.7.0 design but dropped in RC8.
+        # It's a useful metric (very low wire count on a complex board hints at
+        # an incomplete schematic). Trivial to add back:
+        # "wire_count": len(find_all(root, 'wire')),
+    }
+    if include_datasheet_links and datasheet_links:
+        result["datasheet_links"] = datasheet_links
+    return result
+
+
+# ── Plugin registration ───────────────────────────────────────────────────
+
+try:
+    import pcbnew   # [OK] inside try/except (FIX-17)
+    import wx       # [OK] inside try/except (FIX-17)
+    config = _make_config()  # [OK] safe factory after imports (FIX-18)
 
     class LLMAnalyserPlugin(pcbnew.ActionPlugin):
-        ...
+        def defaults(self):
+            self.name = "LLM Schematic/PCB Analyser"
+            self.category = "Analyse"
+            self.description = "v1.7 RC8 - Full Model List"
+            self.show_toolbar_button = True           # [OK] required for KiCad 10 (FIX-4)
+            icon      = os.path.join(_HERE, "icon.png")
+            icon_dark = os.path.join(_HERE, "icon_dark.png")
+            self.icon_file_name      = icon      if os.path.isfile(icon)      else ""  # [OK] FIX-5
+            self.dark_icon_file_name = icon_dark if os.path.isfile(icon_dark) else self.icon_file_name  # [OK] FIX-6
 
-    LLMAnalyserPlugin().register()
+        def Run(self):
+            board = pcbnew.GetBoard()
+            if board is None:
+                wx.MessageBox("Open a PCB first.", "LLM Analyser", wx.OK | wx.ICON_WARNING)
+                return
+            # [BUG-RC8-2] _collect_context called here with include_datasheet_links=False,
+            # then called AGAIN in _on_run() with include_ds from the checkbox.
+            # This parses the .kicad_sch file TWICE on every run — unnecessary IO.
+            # FIXED: pass this initial info to the dialog; _on_run() only re-collects
+            # if the datasheet checkbox is ticked (since this call won't have DS links).
+            info = _collect_context(board, include_datasheet_links=False)
+            dlg = _LLMDialog(None, info)
+            dlg.ShowModal()
+            dlg.Destroy()
 
 except Exception:
-    traceback.print_exc()
-```
+    traceback.print_exc()  # [OK] full traceback to scripting console
+
+
+# ── Dialog ────────────────────────────────────────────────────────────────
+
+class _LLMDialog(wx.Dialog):
+
+    _MODELS = [
+        # [OK] Full model list — good coverage across providers
+        ("Grok 4 (xAI)",             "grok-4",                    "https://api.x.ai/v1",      "xai"),
+        ("Grok 4 Fast (xAI)",        "grok-4-fast",               "https://api.x.ai/v1",      "xai"),
+        ("Grok 3 (xAI)",             "grok-3-latest",             "https://api.x.ai/v1",      "xai"),
+        ("Grok 3 Mini (xAI)",        "grok-3-mini-latest",        "https://api.x.ai/v1",      "xai"),
+        ("Claude Sonnet 4",          "claude-sonnet-4-20250514",  None,                        "anthropic"),
+        ("Claude Opus 4",            "claude-opus-4-20250514",    None,                        "anthropic"),
+        ("GPT-4o (OpenAI)",          "gpt-4o",                    None,                        "openai"),
+        ("GPT-4o-mini (OpenAI)",     "gpt-4o-mini",               None,                        "openai"),
+        # [OK] Gemini added with correct native API format
+        ("Gemini 2.5 Pro (Google)",  "gemini-2.5-pro",            None,                        "gemini"),
+        ("Gemini 2.5 Flash (Google)","gemini-2.5-flash",          None,                        "gemini"),
+        # [OK] Ollama local models — no API key required
+        ("Ollama llama3 (local)",    "llama3",                    "http://localhost:11434/v1", "openai"),
+        ("Ollama mistral (local)",   "mistral",                   "http://localhost:11434/v1", "openai"),
+        ("Ollama gemma2 (local)",    "gemma2",                    "http://localhost:11434/v1", "openai"),
+        ("Ollama qwen2.5 (local)",   "qwen2.5",                   "http://localhost:11434/v1", "openai"),
+    ]
+
+    def __init__(self, parent, info):
+        ...
+        self._info = info  # [OK] stores initial info from Run()
+        self._include_datasheet = False
+        self._build_ui()
+        self._load_last_model_and_key()
+
+    def _build_ui(self):
+        ...
+        # [OK] Datasheet checkbox with explanatory note that hides/shows
+        self._ds_checkbox = wx.CheckBox(p, label="Include Datasheet Links")
+        self._ds_note = wx.StaticText(p, label="Unique datasheet links will be included...")
+        self._ds_note.Hide()
+        ...
+
+    def _on_ds_checkbox(self, event):
+        # [OK] Toggle note visibility when checkbox changes
+        self._include_datasheet = self._ds_checkbox.GetValue()
+        if self._include_datasheet: self._ds_note.Show()
+        else: self._ds_note.Hide()
+        self.Layout()
+
+    def _on_model_changed(self, _event):
+        idx = int(self._model.GetSelection())  # [OK] int() cast — wxString fix (FIX-10)
+        _, _, default_url, api_type = self._MODELS[idx]
+        self._url.SetValue(default_url or "")
+        self._key.SetValue(config.get_api_key(api_type))
+
+    def _on_run(self, _event):
+        idx = int(self._model.GetSelection())   # [OK] FIX-10
+        _, model_id, default_url, api_type = self._MODELS[idx]
+        api_key  = str(self._key.GetValue()).strip()           # [OK] FIX-7
+        base_url = str(self._url.GetValue()).strip() or default_url
+        include_ds = self._ds_checkbox.GetValue()
+
+        if api_key: config.set_api_key(api_type, api_key)
+        config.set_last_model_index(idx)
+
+        # [BUG-RC8-4] "gemini" is excluded from the no-key guard:
+        #   api_type not in ["openai", "gemini"]
+        # But Gemini DOES require an API key! Without the guard, selecting
+        # Gemini with a blank key sends a request to Google which returns
+        # a 400 error — no helpful "Please enter an API key" message.
+        # "openai" is correctly excluded because Ollama uses api_type="openai"
+        # and Ollama needs no key.
+        if not api_key and api_type not in ["openai", "gemini"]:  # ← BUG: gemini should NOT be excluded
+            wx.MessageBox("Please enter an API key.", "Error", wx.OK | wx.ICON_WARNING)
+            return
+        # FIXED version:
+        # if not api_key and api_type != "openai":   # only openai/Ollama needs no key
+
+        ...
+        # [BUG-RC8-2 continued] Second _collect_context call here — should be conditional
+        info = _collect_context(pcbnew.GetBoard(), include_datasheet_links=include_ds)  # ← BUG: always re-collects
+        # FIXED version:
+        # if include_ds and not self._info.get("datasheet_links"):
+        #     info = _collect_context(pcbnew.GetBoard(), include_datasheet_links=True)
+        # else:
+        #     info = self._info   # ← reuse already-collected data
+
+        ...
+
+    def _copy_to_clipboard(self, text):
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(text))
+            wx.TheClipboard.Close()
+        # [OK] Status label instead of modal MessageBox popup (FIX-3)
+        self._copy_status.SetLabel("✓ Copied")
+        wx.CallLater(3000, lambda: self._copy_status.SetLabel("") if self else None)
+
+    def _prompt_both(self, info, include_ds):
+        lines = ["You are an expert reviewing both schematic and PCB.",
+                 "Cross-reference schematic intent vs PCB implementation.",
+                 f"Board: {info['title']}", "Symbols:"]
+        # [NOTE-2] Symbols truncated to 80 — v1.7.0 design allowed 150.
+        # For large boards (100+ components) this will cut off many symbols.
+        # Consider raising to 150 to match the v1.7.0 design limit.
+        for sym in info.get("symbols", [])[:80]:
+            lines.append(f"  {sym['ref']} {sym['value']}")
+            # [NOTE-3] lib_id, footprint, unit, and pin_count are NOT included
+            # in the prompt despite being available in the info dict.
+            # Including them (as in v1.7.0) gives the LLM more context:
+            #   f"  {sym['ref']} {sym['value']} [{sym['lib_id']}] fp:{fp_short}"
+        lines += ["PCB Footprints:"]
+        # [NOTE-2] Same 80-component limit for footprints
+        for fp in info["footprints"][:80]:
+            lines.append(f"  {fp['ref']} {fp['value']}")
+            # [NOTE-3] Layer not included — useful for identifying F.Cu vs B.Cu placement
+        ...
+
+    def _call_llm(self, model_id, api_key, base_url, api_type, info, include_ds):
+        ...
+        elif api_type == "gemini":
+            model_name = model_id
+            # [WARN-1] Gemini API key passed as a URL query parameter.
+            # This is how Google's REST API works — it's the correct approach —
+            # but the key will appear in server access logs and any network proxy
+            # or debug traffic. The alternative (using an Authorization header)
+            # requires OAuth tokens, which is more complex. Acceptable for now.
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            hdrs = {"Content-Type": "application/json"}
+            # [OK] Gemini request format correct: contents/parts structure
+            body = {"contents": [{"parts": [{"text": f"{system}\n\n{prompt}"}]}]}
+        ...
+
+        # [OK] Gemini response parsed correctly:
+        #   candidates[0].content.parts[0].text
+        elif api_type == "gemini":
+            text  = data["candidates"][0]["content"]["parts"][0]["text"]
+            usage = data.get("usageMetadata", {})   # [OK] correct Gemini usage key
+            return text, usage
+
+        # [OK] Gemini token fields handled in _on_run:
+        #   promptTokenCount / candidatesTokenCount / totalTokenCount

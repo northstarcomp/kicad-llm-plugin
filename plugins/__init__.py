@@ -392,8 +392,10 @@ try:
             if board is None:
                 wx.MessageBox("Open a PCB first.", "LLM Analyser", wx.OK | wx.ICON_WARNING)
                 return
+            # BUG-4 FIX: collect once here, pass board ref to dialog.
+            # _on_run() reuses self._info and self._board — no double parse.
             info = _collect_context(board, include_datasheet_links=False)
-            dlg = _LLMDialog(None, info)
+            dlg = _LLMDialog(None, info, board)
             dlg.ShowModal()
             dlg.Destroy()
 
@@ -432,9 +434,10 @@ class _LLMDialog(wx.Dialog):
         ("Ollama qwen2.5 (local)", "qwen2.5", "http://localhost:11434/v1", "openai"),
     ]
 
-    def __init__(self, parent, info):
+    def __init__(self, parent, info, board=None):
         super().__init__(parent, title="LLM Analyser v2.0", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self._info = info
+        self._board = board      # BUG-4 FIX: stored so _on_run doesn't re-call GetBoard()+_collect_context
         self._last_response = ""
         self._previous_response = ""
         self._last_model_name = ""
@@ -641,45 +644,47 @@ class _LLMDialog(wx.Dialog):
         drc = info.get("drc_violations", [])
         layers = info.get("layer_stack", {})
 
+        # BUG-7 FIX: system prompt is passed as a SEPARATE parameter to the API
+        # (as the 'system' field for Anthropic, or as {"role":"system"} for OpenAI).
+        # Do NOT embed it here — it was being sent twice: once as system and once
+        # as the first line of the user message content.
         lines = [
-            self._get_focus_system_prompt(focus_mode, custom_instructions),
-            "",
             f"Board: {info.get('title', 'Untitled')} | Layers: {layers.get('copper_layer_count', 0)}",
-            f"Symbols: {len(syms)} | Power Symbols: {len(pwr)} | DRC Violations: {len(drc)}",
+            f"Symbols: {len(syms)} | Power Symbols: {len(pwr)} | Wires: {info.get('wire_count',0)} | No-connects: {info.get('no_connects',0)} | DRC Violations: {len(drc)}",
             "",
         ]
 
         if drc:
             lines.append("════ DRC VIOLATIONS ════")
-            for v in drc[:12]:
+            for v in drc:                              # NOTE-1: was [:12] — now unlimited
                 lines.append(f"  - {v}")
             lines.append("")
 
         lines.append("════ SCHEMATIC (Hierarchical) ════")
-        for s in syms[:120]:
+        for s in syms:                                 # NOTE-1: was [:120] — now unlimited
             lines.append(f"  {s['ref']}  {s['value']}  [{s['lib_id']}]")
 
         if pwr:
             lines.append("\nPower Symbols:")
-            for p in pwr[:20]:
+            for p in pwr:                              # NOTE-1: was [:20] — now unlimited
                 lines.append(f"  {p['ref']}  {p['value']}")
 
         if sch_nets:
             lines.append(f"\nNet Labels ({len(sch_nets)}):")
-            for n in sch_nets[:60]:
+            for n in sch_nets:                         # NOTE-1: was [:60] — now unlimited
                 lines.append(f"  {n}")
 
         lines.append("\n════ PCB LAYOUT ════")
-        for fp in fps[:120]:
+        for fp in fps:                                 # NOTE-1: was [:120] — now unlimited
             lines.append(f"  {fp['ref']}  {fp['value']}  ({fp['layer']})")
 
         if fp_nets:
-            lines.append("\nPin-to-Net Mapping (sample):")
-            for k, v in list(fp_nets.items())[:50]:
+            lines.append("\nPin-to-Net Mapping:")
+            for k, v in fp_nets.items():               # NOTE-1: was [:50] — now unlimited
                 lines.append(f"  {k} → {v}")
 
         lines.append(f"\nPCB Nets ({len(pcb_nets)}):")
-        for n in pcb_nets[:80]:
+        for n in pcb_nets:                             # NOTE-1: was [:80] — now unlimited
             lines.append(f"  {n}")
 
         if include_ds and info.get("datasheet_links"):
@@ -702,16 +707,16 @@ class _LLMDialog(wx.Dialog):
             "",
             "Footprints:",
         ]
-        for fp in fps[:180]:
+        for fp in fps:                                 # NOTE-1: was [:180] — now unlimited
             lines.append(f"  {fp['ref']}  {fp['value']}  ({fp['layer']})")
 
         if fp_nets:
             lines.append("\nPin-to-Net Mapping:")
-            for k, v in list(fp_nets.items())[:70]:
+            for k, v in fp_nets.items():               # NOTE-1: was [:70] — now unlimited
                 lines.append(f"  {k} → {v}")
 
         lines.append("\nNets:")
-        for n in nets[:120]:
+        for n in nets:                                 # NOTE-1: was [:120] — now unlimited
             lines.append(f"  {n}")
 
         lines.append("\nAnalyze for layout issues, DRC problems, and best practices.")
@@ -727,9 +732,14 @@ class _LLMDialog(wx.Dialog):
             headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
             body = {"model": model_id, "max_tokens": 4096, "system": system_prompt, "messages": [{"role": "user", "content": prompt}], "stream": True}
         elif api_type == "xai":
-            url = (base_url or "https://api.x.ai/v1") + "/chat/completions"
+            # BUG-5 FIX: use /responses endpoint for streaming — same as non-streaming.
+            # Previous code used /chat/completions for streaming but /responses for
+            # non-streaming. xAI streaming via /responses uses SSE with output_text deltas.
+            # BUG-6 FIX: max_output_tokens added (was missing, used server default).
+            url = (base_url or "https://api.x.ai/v1") + "/responses"
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            body = {"model": model_id, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}], "stream": True}
+            body = {"model": model_id, "max_output_tokens": 4096,
+                    "input": f"{system_prompt}\n\n{prompt}", "stream": True}
         elif api_type == "gemini":
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:streamGenerateContent?key={api_key}&alt=sse"
             headers = {"Content-Type": "application/json"}
@@ -754,6 +764,15 @@ class _LLMDialog(wx.Dialog):
                             if api_type == "anthropic":
                                 if "delta" in data and "text" in data.get("delta", {}):
                                     yield data["delta"]["text"]
+                            elif api_type == "xai":
+                                # BUG-5 FIX: /responses SSE format uses output[].content[].text delta
+                                if data.get("type") == "response.output_text.delta":
+                                    yield data.get("delta", "")
+                                elif "output" in data:
+                                    for out in data.get("output", []):
+                                        for part in out.get("content", []):
+                                            if part.get("type") == "output_text":
+                                                yield part.get("text", "")
                             elif api_type == "gemini":
                                 if "candidates" in data and data["candidates"]:
                                     for part in data["candidates"][0].get("content", {}).get("parts", []):
@@ -831,8 +850,13 @@ class _LLMDialog(wx.Dialog):
 
         wx.Yield()
 
-        board = pcbnew.GetBoard()
-        info = _collect_context(board, include_datasheet_links=include_ds)
+        # BUG-4 FIX: reuse self._info from Run(); only re-collect if datasheet
+        # checkbox is ticked and DS links weren't included in the initial pass.
+        if include_ds and not self._info.get("datasheet_links"):
+            info = _collect_context(self._board, include_datasheet_links=True)
+            self._info = info
+        else:
+            info = self._info
 
         if filter_text:
             info = apply_component_filter(info, filter_text)
@@ -849,21 +873,19 @@ class _LLMDialog(wx.Dialog):
             prompt = f"Previous analysis:\n{previous_context}\n\n---\n\nNew request:\n{prompt}"
 
         try:
-            stream = self._call_llm_streaming(model_id, api_key, base_url, api_type, prompt, system_prompt)
-
-            if stream is None:
-                text, usage = self._call_llm_non_streaming(model_id, api_key, base_url, api_type, prompt, system_prompt)
-                self._result.SetValue(text)
-                self._last_response = text
-                self._token_usage = usage or {}
-            else:
-                self._result.SetValue("")
-                full = []
-                for chunk in stream:
-                    full.append(chunk)
-                    wx.CallAfter(self._append_to_result, chunk)
-                    wx.Yield()
-                self._last_response = "".join(full)
+            # BUG-2 FIX: _call_llm_streaming is a generator — it is NEVER None.
+            # The old 'if stream is None' check made the non-streaming fallback
+            # unreachable. Streaming always runs; non-streaming is a separate path
+            # only needed if streaming is explicitly disabled.
+            full = []
+            self._result.SetValue("")
+            # BUG-3 FIX: wx.Yield() removed from streaming loop — calling it
+            # inside a tight generator loop allows re-entrant events (user clicking
+            # Run again mid-stream). wx.CallAfter handles UI updates safely.
+            for chunk in self._call_llm_streaming(model_id, api_key, base_url, api_type, prompt, system_prompt):
+                full.append(chunk)
+                wx.CallAfter(self._append_to_result, chunk)
+            self._last_response = "".join(full)
 
         except Exception as e:
             self._result.SetValue(f"Error:\n{str(e)}")

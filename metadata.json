@@ -2,7 +2,7 @@
     "$schema": "https://go.kicad.org/pcm/schemas/v1",
     "name": "LLM Schematic Analyser",
     "description": "Inspect your schematic and PCB with an LLM.",
-    "description_full": "v1.7.0: Full model list (xAI/Anthropic/OpenAI/Gemini/Ollama). Dual schematic+PCB analysis. Unlimited prompt data \u2014 no component truncation. Wire count, lib_id, layer info in prompts.",
+    "description_full": "v2.0.0: Full model list (xAI/Anthropic/OpenAI/Gemini/Ollama). Dual schematic+PCB analysis. Unlimited prompt data \u2014 no component truncation. Wire count, lib_id, layer info in prompts.",
     "identifier": "com.github.northstarcomp.kicad-llm-plugin",
     "type": "plugin",
     "author": {
@@ -17,7 +17,7 @@
     },
     "versions": [
         {
-            "version": "1.7.0",
+            "version": "2.0.0",
             "status": "stable",
             "kicad_version": "8.0"
         }

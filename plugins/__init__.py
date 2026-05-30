@@ -254,20 +254,27 @@ def _find_and_parse_schematic(pcb_path, include_datasheet_links=False):
         parsed = parse_sexp(text)
         if parsed:
             for sheet in find_all(parsed[0], 'sheet'):
-                for child in sheet:
-                    if isinstance(child, list) and child and child[0] == 'file' and len(child) > 1:
-                        child_path = root_sch.parent / child[1]
-                        if child_path.exists():
-                            child_data = _parse_kicad_sch(child_path, include_datasheet_links)
-                            if child_data:
-                                all_symbols.extend(child_data.get("symbols", []))
-                                all_pwr.extend(child_data.get("pwr_symbols", []))
-                                all_nets.update(child_data.get("sch_nets", []))
-                                total_wires += child_data.get("wire_count", 0)
-                                total_nc += child_data.get("no_connects", 0)
-                                if include_datasheet_links and "datasheet_links" in child_data:
-                                    for url, refs in child_data["datasheet_links"].items():
-                                        datasheet_links.setdefault(url, []).extend(refs)
+                # KiCad 10 format: (sheet (property "Sheet file" "child.kicad_sch") ...)
+                child_file = get_prop(sheet, "Sheet file")
+                # KiCad 8/9 fallback: (sheet (file "child.kicad_sch") ...)
+                if not child_file:
+                    for child in sheet:
+                        if isinstance(child, list) and child and child[0] == 'file' and len(child) > 1:
+                            child_file = child[1]
+                            break
+                if child_file:
+                    child_path = root_sch.parent / child_file
+                    if child_path.exists():
+                        child_data = _parse_kicad_sch(child_path, include_datasheet_links)
+                        if child_data:
+                            all_symbols.extend(child_data.get("symbols", []))
+                            all_pwr.extend(child_data.get("pwr_symbols", []))
+                            all_nets.update(child_data.get("sch_nets", []))
+                            total_wires += child_data.get("wire_count", 0)
+                            total_nc += child_data.get("no_connects", 0)
+                            if include_datasheet_links and "datasheet_links" in child_data:
+                                for url, refs in child_data["datasheet_links"].items():
+                                    datasheet_links.setdefault(url, []).extend(refs)
     except:
         pass
 
@@ -283,14 +290,33 @@ def _find_and_parse_schematic(pcb_path, include_datasheet_links=False):
 
 
 def get_drc_violations(board):
+    """
+    Attempt to surface DRC information from the board.
+    pcbnew.GetDRC() does not exist in KiCad 10's Python API — the DRC engine
+    is only accessible interactively or via the CLI. Instead we report the
+    unconnected net count from the board's connectivity data, which is the
+    most actionable DRC metric available from Python.
+    """
     violations = []
     try:
-        if hasattr(board, "GetDRC"):
-            drc = board.GetDRC()
-            if drc and hasattr(drc, "GetViolations"):
-                for v in drc.GetViolations():
-                    violations.append(str(v))
-    except:
+        # Count unconnected items — the most common and impactful DRC issue
+        connectivity = board.GetConnectivity()
+        if connectivity:
+            unconnected = connectivity.GetUnconnectedCount()
+            if unconnected > 0:
+                violations.append(f"Unconnected items: {unconnected}")
+    except Exception:
+        pass
+    try:
+        # Also surface any markers already placed by a previous interactive DRC run
+        for marker in board.GetMarkers():
+            try:
+                desc = str(marker.GetDescription()) if hasattr(marker, 'GetDescription') else str(marker)
+                if desc and desc not in violations:
+                    violations.append(desc)
+            except Exception:
+                pass
+    except Exception:
         pass
     return violations
 
@@ -848,7 +874,7 @@ class _LLMDialog(wx.Dialog):
             self._result.SetValue("Collecting data...\n")
             self._previous_response = ""
 
-        wx.Yield()
+        wx.Yield()   # Safe: one-time flush before streaming starts, not inside the loop
 
         # BUG-4 FIX: reuse self._info from Run(); only re-collect if datasheet
         # checkbox is ticked and DS links weren't included in the initial pass.
